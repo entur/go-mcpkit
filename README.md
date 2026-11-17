@@ -13,7 +13,7 @@ go get github.com/entur/go-mcpkit # Go 1.26 or later
 Every server built with the kit behaves the same on the wire. The normative description is [doc/contract.md](doc/contract.md); in short:
 
 - Every successful result is a schema-v2 envelope `{schema_version, event_id, untrusted_data}`; server data lives only below `untrusted_data`.
-- A failing call returns one of the tool's fixed error texts, chosen at registration. An error's own text is never rendered.
+- A call that fails inside a registered tool returns one of its fixed error texts, chosen at registration; an error's own text is never rendered. SDK protocol errors (an unknown tool name, say) are JSON-RPC errors.
 - The transport is stateless with JSON responses. Tools by default (prompts, resources and completions are opt-in content), `listChanged: false`, no logging capability, `private` cache scope on every cacheable result.
 - Tools are read-only, and their descriptors and schemas are frozen at registration.
 - Each endpoint states an access posture and a reason: `Protected` (HTTP behind the application's authentication), `PublicReadOnly`, or `LocalProcess` (stdio only). The zero value is refused.
