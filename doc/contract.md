@@ -49,7 +49,7 @@ Every endpoint declares one posture and a non-blank reason: `protected` (HTTP, b
 
 Order of execution for one request; an earlier guard that rejects ends the request:
 
-1. Panic recovery: a panic before anything was written answers a fixed 500; after the response started, its status stays. The application is told only through its optional callback.
+1. Panic recovery: a panic that unwinds through the HTTP handler before anything was written answers a fixed 500; after the response started, its status stays. The application is told only through its optional callback. Tool handlers, observers and content callbacks run on the SDK's own goroutines, outside this recovery: a panic there terminates the process, so they must not panic (or must recover themselves).
 2. Security headers on every response: HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, a `default-src 'none'; frame-ancestors 'none'` CSP.
 3. Application middleware for the whole mux, then routing.
 4. On an MCP route: application pre-guard hook, write deadline, request body cap (enforced when the body is read: a guard that runs earlier, authentication for one, may answer first, the SDK transport answers 413 when it reads past the cap, while application middleware that reads the body, such as a `Protected` wrapper, sees `*http.MaxBytesError` and chooses its own status), the endpoint's authentication, the per-subject rate limit (shared across `protected` routes; over the limit answers 429 with `Retry-After`), application post-limit hook, the transport.
