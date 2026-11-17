@@ -5,9 +5,12 @@ import (
 	"time"
 )
 
-// Observer receives tool events. Every field is optional. Callbacks run
-// synchronously on the call's goroutine and cannot change its outcome; they
-// see sizes and status, never arguments or results.
+// Observer receives tool events. Every field is optional. Callbacks are
+// trusted application code and must not panic: they run synchronously on the
+// call's goroutine, and a panicking Started skips the call's Completed. They
+// cannot change a call's outcome and see sizes and status, never arguments or
+// results, except PackFailure.Err, which can quote a result's own encoding
+// error and is sensitive server-side data.
 type Observer struct {
 	// Registered fires once per registration, on each endpoint a tool is
 	// registered on.

@@ -14,7 +14,7 @@ Every server built with the kit behaves the same on the wire. The normative desc
 
 - Every successful result is a schema-v2 envelope `{schema_version, event_id, untrusted_data}`; server data lives only below `untrusted_data`.
 - A failing call returns one of the tool's fixed error texts, chosen at registration. An error's own text is never rendered.
-- The transport is stateless with JSON responses. Tools only, `listChanged: false`, no logging capability, `private` cache scope on every cacheable result.
+- The transport is stateless with JSON responses. Tools by default (prompts, resources and completions are opt-in content), `listChanged: false`, no logging capability, `private` cache scope on every cacheable result.
 - Tools are read-only, and their descriptors and schemas are frozen at registration.
 - Each endpoint states an access posture and a reason: `Protected` (HTTP behind the application's authentication), `PublicReadOnly`, or `LocalProcess` (stdio only). The zero value is refused.
 - HTTP guards run in a fixed order: panic recovery, security headers, write deadline, body cap, authentication, subject rate limit, transport.
@@ -65,7 +65,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Fatal(ep.RunStdio(context.Background()))
+	if err := ep.RunStdio(context.Background()); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
