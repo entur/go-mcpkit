@@ -1,0 +1,5 @@
+*.test
+*.out
+_artifacts/
+go.work
+go.work.sum
