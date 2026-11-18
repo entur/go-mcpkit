@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/entur/go-mcpkit/compare/v0.1.1...v0.2.0) (2026-11-18)
+
+
+### Features
+
+* add enturauth, an Auth0 resource-server validator ([#9](https://github.com/entur/go-mcpkit/issues/9)) ([3964cc8](https://github.com/entur/go-mcpkit/commit/3964cc889f2a76746d691aa77ec52051102249d6))
+
 ## [0.1.1](https://github.com/entur/go-mcpkit/compare/v0.1.0...v0.1.1) (2026-11-18)
 
 
