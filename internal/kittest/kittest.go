@@ -1,9 +1,13 @@
-// Package kittest holds the module's one piece of mutable package state: a
-// test hook the registration core consults when it registers a tool.
-// Production code never sets it; only package mcpkittest does, from tests.
+// Package kittest holds the module's test hooks: the one piece of mutable
+// package state, a hook the registration core consults when it registers a
+// tool, and the context-scoped signing-key transport enturauth.New reads.
+// Production code never sets either; only mcpkittest and its subpackages do,
+// from tests.
 package kittest
 
 import (
+	"context"
+	"net/http"
 	"sync/atomic"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -33,4 +37,19 @@ func For(tool *mcp.Tool) func(packed []byte) {
 		return (*c)(tool)
 	}
 	return nil
+}
+
+type jwksTransportKey struct{}
+
+// WithJWKSTransport returns ctx carrying rt, which enturauth.New then uses
+// for its signing-key fetches instead of the network. Only
+// mcpkittest/enturauthtest and tests call it.
+func WithJWKSTransport(ctx context.Context, rt http.RoundTripper) context.Context {
+	return context.WithValue(ctx, jwksTransportKey{}, rt)
+}
+
+// JWKSTransport returns the transport ctx carries, or nil.
+func JWKSTransport(ctx context.Context) http.RoundTripper {
+	rt, _ := ctx.Value(jwksTransportKey{}).(http.RoundTripper)
+	return rt
 }

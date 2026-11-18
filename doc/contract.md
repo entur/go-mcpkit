@@ -64,3 +64,42 @@ An observer is trusted application code and must not panic. It runs synchronousl
 - `completed`: exactly once for every started call whose `started` observer returned, after the final result is packed (a recovered panic included); carries duration, output size, whether a result exists and whether it is an error.
 - `pack failed`: when a result could not be packed into the envelope, with the cause and whether encoding itself failed.
 - `recovered`: when a tool handler or result packing panicked, with the panic value and stack; the call answers the fallback failure.
+
+## Auth0 resource server
+
+An endpoint protected by `enturauth` is an OAuth 2 resource server for exactly one pinned Entur Auth0 issuer. It accepts only an RFC 9068 access token in one `Authorization: Bearer` header: compact JWS with three non-empty segments and no duplicate member name in any JSON object, `RS256`, `typ` `at+jwt` or `application/at+jwt`, signed by a key the issuer publishes at `<issuer>.well-known/jwks.json`, with `iss` exactly the issuer, the configured resource in `aud`, a listed `client_id` (never replaced by `azp`; a different `azp` is refused), every required scope in a well-formed `scope` (RFC 6749 scope-tokens separated by single spaces; a malformed one is an invalid token), a lifetime of at most one hour (60 s clock skew), and a JSON integer `https://entur.io/organisationID` of at least 1. The checks, in order, are listed in `doc/adr/0001-enturauth.adoc`.
+
+| Case | Status | `WWW-Authenticate` | Body |
+|---|---|---|---|
+| Several `Authorization` headers, or `access_token` in the query | 400 | `Bearer error="invalid_request", resource_metadata="M", scope="S"` | `bad request` |
+| No Bearer credentials | 401 | `Bearer resource_metadata="M", scope="S"` | `unauthorized` |
+| Any invalid token, or an unknown `kid` | 401 | `Bearer error="invalid_token", resource_metadata="M", scope="S"` | `unauthorized` |
+| A required scope missing | 403 | `Bearer error="insufficient_scope", resource_metadata="M", scope="S"` | `forbidden` |
+| Client not allowed, or organisation not admitted | 403 | none: a new login cannot help | `forbidden` |
+| No usable signing key, or the server is shutting down | 503, `Retry-After: 60` | none | `authentication unavailable` |
+
+- `M` is the metadata URL below and `S` the required scopes, space-separated. Both are fixed at startup from the resource, never from `Host` or `X-Forwarded-*`. Every refusal carries `Cache-Control: no-store`; nothing from the token or an internal error is echoed.
+- Signing keys are refreshed 5 minutes after the last success, and at most once a minute whatever triggers it (an unknown `kid` included, which waits at most 2 s). A key the issuer stops publishing, or whose `kid` it reuses for other key material, is refused from the next fetch on, also for a request whose verification is under way: the key, the snapshot's age, the server's lifetime and the dates are checked again at one instant before admission. Through an outage the last keys serve for 24 hours, then every request is answered 503.
+
+### Credential boundary
+
+- The admitted request moves on without `Authorization`, `Proxy-Authorization` and `Cookie`, so tool handlers never see the bearer, and the server never forwards it. The rejection observer gets the same stripped copy, and for a query token also no `access_token` in its URL or form. The original request is never changed.
+- Out of scope: a client that copies its own token into a tool argument or a custom header. Hooks that run before authentication (an Origin check, say) see the original request.
+
+### Protected-resource metadata
+
+The RFC 9728 document is served at `/.well-known/oauth-protected-resource` followed by the resource's path (path-inserted; no fallback at the root):
+
+```json
+{"resource":"R","authorization_servers":["ISS"],"scopes_supported":["S"],"bearer_methods_supported":["header"]}
+```
+
+`GET` and `HEAD` answer 200 with `Content-Type: application/json`, `Cache-Control: public, max-age=300` and `Access-Control-Allow-Origin: *`; `OPTIONS` answers 204 with the CORS headers; any other method 405.
+
+### Test signing keys
+
+`mcpkittest/enturauthtest` makes an authenticator trust in-memory test keys; its posture reason then starts with `TEST SIGNING KEYS:`. The library's tests prove that no package of the module except `mcpkittest` depends on it. A consumer proves the same for its executables in CI (here `./cmd/...`, in bash):
+
+```sh
+deps="$(go list -deps ./cmd/...)" && ! grep -F github.com/entur/go-mcpkit/mcpkittest <<< "$deps"
+```

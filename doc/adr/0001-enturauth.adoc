@@ -1,0 +1,310 @@
+= 1. `enturauth`: an OAuth resource server for Entur's Auth0 tenants
+
+Date: 2026-11-18
+
+== Status
+
+Accepted. Ships in v0.2.0. The release is tagged only after the gate at the end
+of this record passes.
+
+== Context
+
+Entur's MCP servers that are not tied to Google identity authenticate users
+through Entur's Auth0 tenants. An MCP host (Claude Code, Codex, VS Code and
+others) logs the user in at Auth0 with a pre-registered public client,
+authorization code, PKCE S256 and the RFC 8707 `resource` parameter. It then
+sends the access token as a bearer. The server only has to validate that token
+and publish RFC 9728 protected-resource metadata. Auth0 handles login, consent
+and token issuance. Dynamic client registration is off on the tenants.
+
+The first consumer is a partner-facing server: tenant `partner`, any partner
+organisation, one scope, one-hour tokens refreshed with rotation, no machine
+clients. The design was reached by two independent proposals (one Claude, one
+Codex), a critique round with concrete failure scenarios, and a lead decision on
+the three points that were still open.
+
+== Decision
+
+=== Scope
+
+`enturauth` is a resource-server validator only. It has no `/register`,
+`/authorize`, `/token`, proxy, token envelope or token exchange.
+The library never forwards the inbound token, and never exposes it.
+
+v0.2.0 ships tenant `Partner` with the environments `Dev`
+(`https://partner.dev.entur.org/`), `Tst` (`https://partner.staging.entur.org/`)
+and `Prd` (`https://partner.entur.org/`). Each issuer's JWKS is at
+`<issuer>.well-known/jwks.json`, pinned in code. One authenticator accepts
+exactly one tenant and one environment. There are no defaults: a zero tenant or
+environment is refused.
+
+=== API
+
+[source,go]
+----
+type Tenant uint8 // Partner
+type Env uint8    // Dev, Tst, Prd
+
+type Config struct {
+    Tenant         Tenant
+    Env            Env
+    Resource       string   // canonical https URL = Auth0 API identifier = aud = metadata resource
+    ClientIDs      []string // pre-registered public clients (exact client_id match)
+    RequiredScopes []string // all required; advertised in metadata and challenges
+    Admission      Admission
+    OnReject       func(*http.Request, Reason) // optional; stripped request; must not panic
+    OnRefresh      func(issuer string, err error) // optional; must not panic
+}
+
+func AllowAnyOrganisation(reason string) Admission
+
+func New(ctx context.Context, cfg Config) (*Authenticator, error)
+func (*Authenticator) Access() mcpkit.Access                      // mcpkit.Protected(...)
+func (*Authenticator) MountMetadata(mux *http.ServeMux) error    // registration conflicts are errors
+func (*Authenticator) Ready() error                               // first usable key load
+
+type Principal struct {
+    Issuer, Subject, ClientID string
+    Organisation              int64
+}
+func FromContext(context.Context) (Principal, bool)
+func SubjectKey(context.Context) (string, bool) // httpguard.SubjectKey over (Issuer, Subject)
+----
+
+`New` refuses each of the following:
+
+* an unknown tenant or environment;
+* a `Resource` that is not a clean `https` URL: lowercase host, no userinfo,
+  query, fragment, `%` or trailing slash. A shared Entur API audience (a bare
+  `api{.dev,.staging,}.entur.io`) is refused, and so is the issuer's own host;
+* empty or malformed client IDs;
+* required scopes that are empty, duplicated, malformed, or an OIDC scope
+  (`openid`, `profile`, `email`, `address`, `phone`, `offline_access`);
+* a zero `Admission` or a blank reason;
+* an already-cancelled `ctx`.
+
+There is no exported verifier, key source, HTTP client, leeway, lifetime or
+skip switch.
+
+=== Token contract (RFC 9068 only)
+
+The checks below run in order. Every check that needs no key runs before key
+lookup, so a token naming another issuer can never start or join a fetch.
+Only the pinned, configured issuer is ever a fetch target.
+
+. Request: exactly one `Authorization: Bearer` header. Several
+  `Authorization` headers, or a token in the query string (`access_token`),
+  get 400 `invalid_request`.
+. Framing: a compact JWS of at most 8 KiB. Only the characters
+  `[A-Za-z0-9_.-]` and exactly two dots are allowed. Each segment is strict
+  unpadded base64url.
+. Header: `alg` exactly `RS256`; `typ` exactly `at+jwt` or `application/at+jwt`;
+  a non-empty `kid`. Refused when present: `crit` (any), `b64`, `zip`, `jku`,
+  `x5u`, `jwk` and `x5c`. JSON objects with duplicate member names are refused,
+  and member names match case-sensitively.
+. Unverified claims, still before key lookup:
+** `iss` equals the configured issuer exactly, trailing slash included.
+** `aud` is a string, or an array of strings, that contains `Resource`.
+** `sub`, `jti` and `client_id` are non-empty strings, and none of them, nor
+   `iss`, contains U+FFFD.
+** The dates are well formed (see below).
+** Refused when present: `cnf`, `act`, `sub_profile` and `client_profile`.
+. Key and signature: the `kid` must be in the issuer's current usable key set
+  (see Signing keys), then RS256 is verified with `crypto/rsa`.
+. Dates, evaluated at the admission decision, after any key wait. The
+  allowed clock skew is L = 60 s, and every date is a JSON integer in
+  `[1, 253402300799]`:
+** `exp` and `iat` are required, and `nbf` is optional;
+** `now < exp + L`;
+** `iat <= now + L`;
+** `nbf <= now + L` and `nbf < exp`, when `nbf` is present;
+** `0 < exp - iat <= 3600`.
++
+All arithmetic is overflow-safe.
+. Authorization, after a valid signature (403 cases):
+** `client_id` is in `ClientIDs`. It is never replaced by `azp`, and a
+   conflicting `azp` is refused.
+** `scope` is a space-delimited string that contains every required scope.
+** `https://entur.io/organisationID` is a JSON integer in `[1, 2^63-1]`.
+** The admission policy accepts it (`AllowAnyOrganisation`: any valid
+   organisation).
+
+The library implements the framing itself with the standard library
+(`crypto/rsa`, `crypto/sha256`, strict base64url, and a
+duplicate-rejecting JSON member walk). No JOSE dependency is added: the
+contract is one algorithm and one serialization, and a library would add
+features we would have to turn off. A fuzz target covers the parser.
+`github.com/go-jose/go-jose/v4` is the documented fallback if review rejects
+the in-house framing.
+
+=== Responses
+
+[cols="2,1,2,1"]
+|===
+| Case | Status | `WWW-Authenticate` | Body
+
+| Several `Authorization` headers, or a token in the query string
+| 400 | `Bearer error="invalid_request", resource_metadata=…, scope=…` | `bad request`
+
+| No credentials
+| 401 | `Bearer resource_metadata=…, scope=…` | `unauthorized`
+
+| Any invalid token, or an unknown `kid` in a usable key set
+| 401 | `Bearer error="invalid_token", resource_metadata=…, scope=…` | `unauthorized`
+
+| Required scope missing
+| 403 | `Bearer error="insufficient_scope", resource_metadata=…, scope=…` | `forbidden`
+
+| Client not allowed, or admission denied
+| 403 | none (a new login cannot help) | `forbidden`
+
+| No usable keys (never loaded, expired after 24 h), or the lifetime context has ended
+| 503, `Retry-After: 60`, `Cache-Control: no-store` | none | `authentication unavailable`
+|===
+
+Every 400, 401, 403 and 503 also carries `Cache-Control: no-store`.
+
+The challenge strings and the metadata document are computed once, in `New`,
+from `Resource`. They are never built from `Host` or `X-Forwarded-*`. Nothing
+from a token or an error is echoed back, and the library logs nothing itself:
+`OnReject` and `OnRefresh` report a fixed `Reason` and a fetch error (the pinned
+URL and an HTTP status only).
+
+=== Bearer containment
+
+Before the request moves on, its header map is cloned, and `Authorization`,
+`Proxy-Authorization` and `Cookie` are removed from the clone. The tool layer's
+raw request headers therefore never contain the credential. `OnReject` receives
+the same stripped copy. For the query-token rejection, the observer's copy also
+has the `access_token` parameter removed from both `URL` and `RequestURI`. The
+original request is never mutated. This boundary covers the supported credential carriers
+only. A client that copies its own token into a tool argument or a custom header
+is out of scope. Hooks that run before authentication (for example an Origin
+gate) see the original request.
+
+=== Protected-resource metadata
+
+The path-inserted RFC 9728 document is served at
+`/.well-known/oauth-protected-resource<path of Resource>`, with no fallback at
+the root:
+
+----
+{"resource":R,"authorization_servers":[ISS],"scopes_supported":RequiredScopes,"bearer_methods_supported":["header"]}
+----
+
+* `GET` and `HEAD`: 200 with `Content-Type: application/json`,
+  `Cache-Control: public, max-age=300` and `Access-Control-Allow-Origin: *`.
+* `OPTIONS`: 204.
+* Any other method: 405.
+
+The application calls `MountMetadata(mux)` on its `HTTPOptions.Mux`. A pattern
+conflict comes back as an error, not a panic. `mcpkit` does not import
+`enturauth`.
+
+=== Signing keys
+
+There is one keyring per authenticator. The following values are constants:
+
+* refresh 5 min after the last success;
+* a retry floor of 1 min, shared by every trigger;
+* a 2 s fetch timeout;
+* a 64 KiB body limit;
+* a last-good window of 24 h;
+* a limit of 16 keys.
+
+The fetch uses its own `http.Client`: no redirects, cookies, credentials or
+compression, and a body read capped at limit+1.
+
+* *Usable key*: `kty` is `RSA`, `use` is absent or `sig`, `key_ops` is absent
+  or exactly `["verify"]`, `alg` is absent or `RS256`, `e` is `AQAB`, the
+  modulus is 2048–8192 bits and `kid` is non-empty.
+  `x5c`, `x5t` and `jku` are ignored. A duplicate `kid` among usable keys
+  invalidates the whole document.
+* *Success*: a well-formed 200 replaces the snapshot wholesale, even when it
+  holds no usable key. A key missing from the new document is gone at once.
+  An outage never restores it.
+* *Failure*: a transport error, timeout, non-200, redirect, oversize body,
+  malformed JSON or ambiguous `kid` keeps the last-good snapshot. Its age still
+  counts from the last success.
+* *Unknown `kid`*: the request joins the one in-flight fetch, or starts one if
+  the floor allows, and waits at most 2 s (or until its own context ends). A
+  known `kid` never waits. A flood of unknown `kid`s causes at most one fetch
+  per minute.
+* Every acceptance looks its `kid` up in the current snapshot, so a removed key
+  stops validating at once. There is no verdict cache.
+* `New` runs the first fetch inline, bounded by 2 s. A failure is not an error:
+  `Ready()` reports it, and the background loop retries every minute.
+* `Ready()` reports the first usable load. It is meant for a startup probe, not
+  for liveness, because a 24 h outage must not cause a restart loop. Each
+  request answers 503 while no key is usable.
+* The loop ends with `ctx`. After that, no new request is admitted (503). A
+  `ctx` with a deadline is allowed.
+* Callbacks run outside the lock. The snapshot is published and the flight
+  completed under the keyring lock, and `OnRefresh` is called only after the
+  lock is released. Callback time is not part of the 2 s fetch budget, so
+  callbacks must return promptly.
+
+=== Testing seam
+
+Tests need signing keys the library does not trust in production. A
+context-scoped JWKS transport hook in `internal/kittest` is installed only
+through `mcpkittest/enturauthtest`. This change adds the guards, which do not
+exist yet:
+
+* In this module, no non-test package depends, directly or transitively, on
+  `mcpkittest` or any of its subpackages.
+* The internal setter is called only from those helpers and tests.
+* `doc/contract.md` gives consumers a one-line CI recipe (`go list -deps` over
+  their executables) that proves the same for their binaries. This library's
+  CI cannot inspect downstream executables.
+
+An authenticator built with test keys puts `TEST SIGNING KEYS:` at the start of
+its posture reason, so the startup posture log shows it. That prefix is a
+diagnostic, not the protection.
+
+=== Cut from v0.2.0
+
+The following are not in v0.2.0, each with the reason:
+
+* The `Authorizer`/`Requirement` seam (Permission Store): one scope and
+  admission are enough for now.
+* `Employees()`: no signed proof of employment has been settled.
+  `organisationID = 1` alone does not prove it.
+* The `Internal`, `Traveller` and `Person` tenants, machine clients and end
+  customers: no consumer yet.
+* The Auth0-profile dialect (`azp`, `typ: JWT`): RFC 9068 for every new API.
+  A legacy profile would be a separately reviewed policy, never a fallback.
+* PS256 and other algorithms.
+* Configurable leeway or lifetime.
+* A verdict cache.
+* Roles, scopes, email or tenant on `Principal`.
+* Root metadata fallback, discovery fetches, DPoP, `jti` replay checks and
+  revocation.
+* A mounting hook in `mcpkit`.
+
+== Consequences
+
+* An MCP server gets Auth0 validation, metadata and challenges by
+  construction, with no per-server token code.
+* The validator keeps working through Auth0 or JWKS outages of up to 24 h, and
+  it never resurrects a removed key.
+* `mcpkit` is unchanged. `enturauth` plugs in through `Protected` and the
+  application mux.
+* The in-house framing is security code that we own. It is mitigated by one
+  algorithm, standard-library crypto, an exhaustive negative table, a fuzz
+  target and code-owner review.
+* Every user is refused if a tenant changes its token shape (for example
+  `organisationID` arriving as a string, or a different `typ`). The failure is
+  closed and visible through `OnReject`.
+
+== Release gate for v0.2.0
+
+The feature merges when it has been reviewed. The release pull request for
+v0.2.0 waits until both of these hold:
+
+. A real token from the partner dev tenant has been verified against this
+  contract: `typ`, `client_id`, `jti`, `aud`, `scope`, lifetime and the
+  `organisationID` shape. This must hold for the token from the initial PKCE
+  login and for one obtained through a rotated refresh token.
+. A real MCP client has completed login, refresh, a tool call and the refusal
+  cases against a server on the dev tenant.
