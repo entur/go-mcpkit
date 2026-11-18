@@ -226,13 +226,10 @@ func TestRefreshCallbackOutsideTheLock(t *testing.T) {
 	}
 }
 
-// TestJWKS runs one refresh per document and checks what it leaves usable.
-func TestJWKS(t *testing.T) {
-	t.Parallel()
-	a0 := enturauthtest.New(t)
-	cfg := config()
-	dev := enturauthtest.Issuer(cfg)
-	resp, err := kittest.JWKSTransport(a0.Context(t.Context())).RoundTrip(httptest.NewRequest(http.MethodGet, dev+".well-known/jwks.json", nil))
+// publishedKey is the JWK the stand-in publishes for issuer.
+func publishedKey(t *testing.T, a0 *enturauthtest.Auth0, issuer string) map[string]any {
+	t.Helper()
+	resp, err := kittest.JWKSTransport(a0.Context(t.Context())).RoundTrip(httptest.NewRequest(http.MethodGet, issuer+".well-known/jwks.json", nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,29 +239,105 @@ func TestJWKS(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
 		t.Fatal(err)
 	}
-	key := doc.Keys[0]
-	with := func(kv ...any) map[string]any {
-		k := maps.Clone(key)
-		set(k, kv)
-		return k
+	return doc.Keys[0]
+}
+
+func with(key map[string]any, kv ...any) map[string]any {
+	k := maps.Clone(key)
+	set(k, kv)
+	return k
+}
+
+func jwks(keys ...map[string]any) []byte {
+	return js(map[string]any{"keys": append([]map[string]any{}, keys...)})
+}
+
+func answer(status int, body []byte, header ...string) func(*http.Request) (*http.Response, error) {
+	return func(*http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		for i := 0; i < len(header); i += 2 {
+			rec.Header().Set(header[i], header[i+1])
+		}
+		rec.WriteHeader(status)
+		_, _ = rec.Write(body)
+		return rec.Result(), nil
 	}
-	jwks := func(keys ...map[string]any) []byte {
-		return js(map[string]any{"keys": append([]map[string]any{}, keys...)})
+}
+
+// modulus is a base64url modulus of the given size.
+func modulus(bits uint) string { return b64(new(big.Int).Lsh(big.NewInt(1), bits-1).Bytes()) }
+
+// TestAdmissionDecision holds a verification between its key lookup and the
+// admission decision while the keyring changes: the decision follows the
+// keyring and the clock at that instant.
+func TestAdmissionDecision(t *testing.T) {
+	t.Parallel()
+	a0 := enturauthtest.New(t)
+	cfg := config()
+	dev := enturauthtest.Issuer(cfg)
+	key := publishedKey(t, a0, dev)
+	wait := func(d time.Duration) func(*testing.T, *enturauth.Authenticator, context.CancelFunc) {
+		return func(*testing.T, *enturauth.Authenticator, context.CancelFunc) { time.Sleep(d) }
 	}
-	answer := func(status int, body []byte, header ...string) func(*http.Request) (*http.Response, error) {
-		return func(*http.Request) (*http.Response, error) {
-			rec := httptest.NewRecorder()
-			for i := 0; i < len(header); i += 2 {
-				rec.Header().Set(header[i], header[i+1])
-			}
-			rec.WriteHeader(status)
-			_, _ = rec.Write(body)
-			return rec.Result(), nil
+	refetch := func(doc []byte) func(*testing.T, *enturauth.Authenticator, context.CancelFunc) {
+		return func(t *testing.T, a *enturauth.Authenticator, _ context.CancelFunc) {
+			a0.Outage(answer(http.StatusOK, doc))
+			time.Sleep(time.Minute)
+			rec, _ := serve(a, t.Context(), "/partner", "Bearer "+a0.Sign(dev, []byte(`{"alg":"RS256","typ":"at+jwt","kid":"k0"}`), js(a0.Claims(cfg))))
+			checkResponse(t, "refetch", rec, enturauth.RejectUnknownKey)
 		}
 	}
+	for _, tc := range []struct {
+		name      string
+		held      time.Duration // through an outage, before the request
+		edit      func(c map[string]any)
+		meanwhile func(*testing.T, *enturauth.Authenticator, context.CancelFunc)
+		want      enturauth.Reason
+	}{
+		{"same key fetched again", 0, nil, refetch(jwks(key)), ""},
+		{"key removed", 0, nil, refetch(jwks(with(key, "kid", "k2"))), enturauth.RejectUnknownKey},
+		{"same kid, other key material", 0, nil, refetch(jwks(with(key, "n", modulus(2048)))), enturauth.RejectUnknownKey},
+		{"lifetime ended", 0, nil, func(_ *testing.T, _ *enturauth.Authenticator, cancel context.CancelFunc) { cancel() }, enturauth.RejectUnavailable},
+		{"last good window ended", 24*time.Hour - time.Second, nil, wait(time.Second), enturauth.RejectUnavailable},
+		{"expired meanwhile", 0, func(c map[string]any) { c["iat"], c["exp"] = c["iat"].(int64)-3600, c["iat"].(int64)-59 }, wait(time.Second), enturauth.RejectDates},
+	} {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			defer a0.Outage(nil)
+			a := start(t, ctx, a0, cfg)
+			if tc.held > 0 {
+				a0.Outage(down)
+				time.Sleep(tc.held)
+			}
+			c := a0.Claims(cfg)
+			if tc.edit != nil {
+				tc.edit(c)
+			}
+			token := a0.Token(c)
+			reached, release, result := make(chan struct{}), make(chan struct{}), make(chan *httptest.ResponseRecorder)
+			enturauth.PauseAfterKeyLookup(a, func() { close(reached); <-release })
+			go func() {
+				rec, _ := serve(a, t.Context(), "/partner", "Bearer "+token)
+				result <- rec
+			}()
+			<-reached
+			enturauth.PauseAfterKeyLookup(a, nil)
+			tc.meanwhile(t, a, cancel)
+			close(release)
+			checkResponse(t, tc.name, <-result, tc.want)
+		})
+	}
+}
+
+// TestJWKS runs one refresh per document and checks what it leaves usable.
+func TestJWKS(t *testing.T) {
+	t.Parallel()
+	a0 := enturauthtest.New(t)
+	cfg := config()
+	key := publishedKey(t, a0, enturauthtest.Issuer(cfg))
 	ok := func(body []byte) func(*http.Request) (*http.Response, error) { return answer(http.StatusOK, body) }
 	full := slices.Concat(jwks(key), []byte(strings.Repeat(" ", 64<<10-len(jwks(key)))))
-	modulus := func(bits uint) string { return b64(new(big.Int).Lsh(big.NewInt(1), bits-1).Bytes()) }
 	failure := regexp.MustCompile(`^enturauth: https://partner\.dev\.entur\.org/\.well-known/jwks\.json: [a-zA-Z0-9 ]+$`)
 	for _, tc := range []struct {
 		name   string
@@ -290,24 +363,24 @@ func TestJWKS(t *testing.T) {
 		{"duplicate key member", ok([]byte(`{"keys":[` + string(member(js(key), `"kty":"RSA"`)) + `]}`)), true, ""},
 		{"trailing data", ok(slices.Concat(jwks(key), []byte("{}"))), true, ""},
 		{"ambiguous kid", ok(jwks(key, key)), true, ""},
-		{"17 keys", ok(jwks(slices.Repeat([]map[string]any{with("use", "enc")}, 17)...)), true, ""},
-		{"16 keys", ok(jwks(append(slices.Repeat([]map[string]any{with("use", "enc")}, 15), key)...)), false, ""},
+		{"17 keys", ok(jwks(slices.Repeat([]map[string]any{with(key, "use", "enc")}, 17)...)), true, ""},
+		{"16 keys", ok(jwks(append(slices.Repeat([]map[string]any{with(key, "use", "enc")}, 15), key)...)), false, ""},
 		{"no keys", ok(jwks()), false, enturauth.RejectUnavailable},
-		{"use enc", ok(jwks(with("use", "enc"))), false, enturauth.RejectUnavailable},
-		{"use and alg absent", ok(jwks(with("use", del{}, "alg", del{}))), false, ""},
-		{"key_ops verify", ok(jwks(with("key_ops", []any{"verify"}))), false, ""},
-		{"key_ops sign", ok(jwks(with("key_ops", []any{"sign"}))), false, enturauth.RejectUnavailable},
-		{"key_ops verify and sign", ok(jwks(with("key_ops", []any{"verify", "sign"}))), false, enturauth.RejectUnavailable},
-		{"alg RS384", ok(jwks(with("alg", "RS384"))), false, enturauth.RejectUnavailable},
-		{"kty EC", ok(jwks(with("kty", "EC"))), false, enturauth.RejectUnavailable},
-		{"kty rsa", ok(jwks(with("kty", "rsa"))), false, enturauth.RejectUnavailable},
-		{"e 3", ok(jwks(with("e", "Aw"))), false, enturauth.RejectUnavailable},
-		{"kid empty", ok(jwks(with("kid", ""))), false, enturauth.RejectUnavailable},
-		{"modulus 2047 bits", ok(jwks(with("n", modulus(2047)))), false, enturauth.RejectUnavailable},
-		{"modulus 8193 bits", ok(jwks(with("n", modulus(8193)))), false, enturauth.RejectUnavailable},
-		{"modulus not base64url", ok(jwks(with("n", "AQAB="))), false, enturauth.RejectUnavailable},
-		{"unusable duplicate kid", ok(jwks(key, with("use", "enc"))), false, ""},
-		{"x5c and x5t ignored", ok(jwks(with("x5c", []any{"not a certificate"}, "x5t", "x"))), false, ""},
+		{"use enc", ok(jwks(with(key, "use", "enc"))), false, enturauth.RejectUnavailable},
+		{"use and alg absent", ok(jwks(with(key, "use", del{}, "alg", del{}))), false, ""},
+		{"key_ops verify", ok(jwks(with(key, "key_ops", []any{"verify"}))), false, ""},
+		{"key_ops sign", ok(jwks(with(key, "key_ops", []any{"sign"}))), false, enturauth.RejectUnavailable},
+		{"key_ops verify and sign", ok(jwks(with(key, "key_ops", []any{"verify", "sign"}))), false, enturauth.RejectUnavailable},
+		{"alg RS384", ok(jwks(with(key, "alg", "RS384"))), false, enturauth.RejectUnavailable},
+		{"kty EC", ok(jwks(with(key, "kty", "EC"))), false, enturauth.RejectUnavailable},
+		{"kty rsa", ok(jwks(with(key, "kty", "rsa"))), false, enturauth.RejectUnavailable},
+		{"e 3", ok(jwks(with(key, "e", "Aw"))), false, enturauth.RejectUnavailable},
+		{"kid empty", ok(jwks(with(key, "kid", ""))), false, enturauth.RejectUnavailable},
+		{"modulus 2047 bits", ok(jwks(with(key, "n", modulus(2047)))), false, enturauth.RejectUnavailable},
+		{"modulus 8193 bits", ok(jwks(with(key, "n", modulus(8193)))), false, enturauth.RejectUnavailable},
+		{"modulus not base64url", ok(jwks(with(key, "n", "AQAB="))), false, enturauth.RejectUnavailable},
+		{"unusable duplicate kid", ok(jwks(key, with(key, "use", "enc"))), false, ""},
+		{"x5c and x5t ignored", ok(jwks(with(key, "x5c", []any{"not a certificate"}, "x5t", "x"))), false, ""},
 	} {
 		synctest.Test(t, func(t *testing.T) {
 			refreshed := make(chan error, 4)

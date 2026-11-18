@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
@@ -23,6 +22,7 @@ const (
 	leeway      = 60           // seconds of allowed clock skew
 	maxLifetime = 3600         // seconds from iat to exp
 	maxDate     = 253402300799 // 9999-12-31T23:59:59Z
+	maxDepth    = 32           // nesting of a JSON document
 	orgClaim    = "https://entur.io/organisationID"
 	tokenBytes  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_."
 )
@@ -96,21 +96,33 @@ func (a *Authenticator) verify(ctx context.Context, token string) (Principal, Re
 	if why != "" {
 		return Principal{}, why
 	}
+	if a.afterKeyLookup != nil {
+		a.afterKeyLookup()
+	}
 	sum := sha256.Sum256([]byte(t.signed))
 	if rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], t.signature) != nil {
 		return Principal{}, RejectSignature
 	}
 
-	nowSec := time.Now().Unix() // after any key wait
+	// The admission decision: the key that verified is still eligible, and
+	// the dates hold, at one instant.
+	now, why := a.keys.confirm(t.kid, pub)
+	if why != "" {
+		return Principal{}, why
+	}
+	nowSec := now.Unix()
 	if nowSec >= exp+leeway || iat > nowSec+leeway || (hasNBF && (nbf > nowSec+leeway || nbf >= exp)) || exp-iat <= 0 || exp-iat > maxLifetime {
 		return Principal{}, RejectDates
 	}
 
 	_, hasAZP := c["azp"]
-	scope, _ := c.str("scope")
+	_, hasScope := c["scope"]
+	scope, isString := c.str("scope")
 	granted := strings.Split(scope, " ")
 	org, orgOK := integer(c[orgClaim], math.MaxInt64)
 	switch {
+	case hasScope && (!isString || slices.ContainsFunc(granted, badScopeToken)): // malformed, not missing
+		return Principal{}, RejectClaims
 	case !slices.Contains(a.clientIDs, client) || (hasAZP && !c.is("azp", client)): // never replaced by azp
 		return Principal{}, RejectClient
 	case slices.ContainsFunc(a.scopes, func(s string) bool { return !slices.Contains(granted, s) }):
@@ -158,13 +170,20 @@ func integer(raw json.RawMessage, limit int64) (int64, bool) {
 	return n, err == nil && n >= 1 && n <= limit
 }
 
-// unb64 decodes strict unpadded base64url.
-func unb64(s string) ([]byte, error) { return base64.RawURLEncoding.Strict().DecodeString(s) }
+// unb64 decodes non-empty strict unpadded base64url.
+func unb64(s string) ([]byte, error) {
+	if s == "" {
+		return nil, errors.New("empty")
+	}
+	return base64.RawURLEncoding.Strict().DecodeString(s)
+}
 
-// members decodes one JSON object, refusing duplicate member names (compared
-// after unescaping) and trailing data.
+// members decodes one JSON object into its members. Duplicate member names,
+// compared after unescaping, are refused in every object it contains, and so
+// are nesting deeper than maxDepth and trailing data.
 func members(b []byte) (object, error) {
 	d := json.NewDecoder(bytes.NewReader(b))
+	d.UseNumber()
 	if t, err := d.Token(); err != nil || t != json.Delim('{') {
 		return nil, errors.New("not a JSON object")
 	}
@@ -175,14 +194,14 @@ func members(b []byte) (object, error) {
 			return nil, err
 		}
 		name, _ := t.(string)
-		var v json.RawMessage
-		if err := d.Decode(&v); err != nil {
-			return nil, err
-		}
 		if _, dup := m[name]; dup {
 			return nil, errors.New("duplicate member")
 		}
-		m[name] = v
+		start := d.InputOffset()
+		if err := walk(d, 1); err != nil {
+			return nil, err
+		}
+		m[name] = bytes.TrimLeft(b[start:d.InputOffset()], " \t\r\n:")
 	}
 	if _, err := d.Token(); err != nil {
 		return nil, err
@@ -191,6 +210,41 @@ func members(b []byte) (object, error) {
 		return nil, errors.New("trailing data")
 	}
 	return m, nil
+}
+
+// walk consumes one JSON value, refusing duplicate member names in every
+// object it contains and nesting deeper than maxDepth.
+func walk(d *json.Decoder, depth int) error {
+	t, err := d.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := t.(json.Delim)
+	if !ok {
+		return nil
+	}
+	if depth >= maxDepth {
+		return errors.New("too deep")
+	}
+	seen := map[string]bool{}
+	for d.More() {
+		if delim == '{' {
+			t, err := d.Token()
+			if err != nil {
+				return err
+			}
+			name, _ := t.(string)
+			if seen[name] {
+				return errors.New("duplicate member")
+			}
+			seen[name] = true
+		}
+		if err := walk(d, depth+1); err != nil {
+			return err
+		}
+	}
+	_, err = d.Token()
+	return err
 }
 
 // str returns member name when it is a JSON string.

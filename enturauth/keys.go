@@ -216,22 +216,40 @@ func (k *keyring) key(ctx context.Context, kid string) (*rsa.PublicKey, Reason) 
 func (k *keyring) lookup(kid string, fetch bool) (*rsa.PublicKey, Reason, <-chan struct{}) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if k.ctx.Err() != nil {
-		return nil, RejectUnavailable, nil
-	}
 	now := time.Now()
-	fresh := now.Sub(k.loaded) < lastGood && len(k.keys) > 0
-	if pub := k.keys[kid]; fresh && pub != nil {
-		return pub, "", nil
-	}
+	pub, why := k.eligible(kid, now)
 	var done <-chan struct{}
-	if fetch {
+	if why != "" && fetch {
 		done = k.start(now)
 	}
-	if !fresh {
-		return nil, RejectUnavailable, done
+	return pub, why, done
+}
+
+// confirm takes the admission decision under the lock, without a fetch: the
+// lifetime and the snapshot are still usable and kid still names pub's key
+// material (compared by value, so a refetch of the same key passes). It
+// returns the decision's time for the date checks.
+func (k *keyring) confirm(kid string, pub *rsa.PublicKey) (time.Time, Reason) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	now := time.Now()
+	current, why := k.eligible(kid, now)
+	if why == "" && !current.Equal(pub) {
+		why = RejectUnknownKey
 	}
-	return nil, RejectUnknownKey, done
+	return now, why
+}
+
+// eligible returns kid's key while the lifetime lasts and the snapshot is
+// usable at now. The caller holds mu.
+func (k *keyring) eligible(kid string, now time.Time) (*rsa.PublicKey, Reason) {
+	if k.ctx.Err() != nil || now.Sub(k.loaded) >= lastGood || len(k.keys) == 0 {
+		return nil, RejectUnavailable
+	}
+	if pub := k.keys[kid]; pub != nil {
+		return pub, ""
+	}
+	return nil, RejectUnknownKey
 }
 
 // await waits for done, at most fetchTimeout, or until ctx ends.

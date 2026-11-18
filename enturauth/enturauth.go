@@ -121,6 +121,9 @@ type Authenticator struct {
 	onReject  func(*http.Request, Reason)
 	posture   string
 	keys      *keyring
+	// afterKeyLookup, set only by export_test.go, pauses a verification
+	// between its key lookup and the admission decision.
+	afterKeyLookup func()
 
 	metaPath  string
 	metadata  []byte
@@ -200,11 +203,16 @@ func badClientID(id string) bool {
 	return id == "" || len(id) > 128 || strings.Trim(id, idBytes) != ""
 }
 
-// badScope refuses what is not an RFC 6749 scope-token without '"' and '\',
-// and the OIDC scopes every login carries.
+// badScopeToken reports whether s is not an RFC 6749 scope-token: one or more
+// printable ASCII characters other than space, '"' and '\'.
+func badScopeToken(s string) bool {
+	return s == "" || strings.ContainsFunc(s, func(r rune) bool { return r <= ' ' || r > '~' || r == '"' || r == '\\' })
+}
+
+// badScope refuses a malformed scope-token, and the OIDC scopes every login
+// carries.
 func badScope(s string) bool {
-	return s == "" || strings.ContainsFunc(s, func(r rune) bool { return r <= ' ' || r > '~' || r == '"' || r == '\\' }) ||
-		slices.Contains([]string{"openid", "profile", "email", "address", "phone", "offline_access"}, s)
+	return badScopeToken(s) || slices.Contains([]string{"openid", "profile", "email", "address", "phone", "offline_access"}, s)
 }
 
 func duplicated(s []string) bool {

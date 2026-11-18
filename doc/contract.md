@@ -67,7 +67,7 @@ An observer is trusted application code and must not panic. It runs synchronousl
 
 ## Auth0 resource server
 
-An endpoint protected by `enturauth` is an OAuth 2 resource server for exactly one pinned Entur Auth0 issuer. It accepts only an RFC 9068 access token in one `Authorization: Bearer` header: compact JWS, `RS256`, `typ` `at+jwt` or `application/at+jwt`, signed by a key the issuer publishes at `<issuer>.well-known/jwks.json`, with `iss` exactly the issuer, the configured resource in `aud`, a listed `client_id` (never replaced by `azp`; a different `azp` is refused), every required scope in `scope`, a lifetime of at most one hour (60 s clock skew), and a JSON integer `https://entur.io/organisationID` of at least 1. The checks, in order, are listed in `doc/adr/0001-enturauth.adoc`.
+An endpoint protected by `enturauth` is an OAuth 2 resource server for exactly one pinned Entur Auth0 issuer. It accepts only an RFC 9068 access token in one `Authorization: Bearer` header: compact JWS with three non-empty segments and no duplicate member name in any JSON object, `RS256`, `typ` `at+jwt` or `application/at+jwt`, signed by a key the issuer publishes at `<issuer>.well-known/jwks.json`, with `iss` exactly the issuer, the configured resource in `aud`, a listed `client_id` (never replaced by `azp`; a different `azp` is refused), every required scope in a well-formed `scope` (RFC 6749 scope-tokens separated by single spaces; a malformed one is an invalid token), a lifetime of at most one hour (60 s clock skew), and a JSON integer `https://entur.io/organisationID` of at least 1. The checks, in order, are listed in `doc/adr/0001-enturauth.adoc`.
 
 | Case | Status | `WWW-Authenticate` | Body |
 |---|---|---|---|
@@ -79,7 +79,7 @@ An endpoint protected by `enturauth` is an OAuth 2 resource server for exactly o
 | No usable signing key, or the server is shutting down | 503, `Retry-After: 60` | none | `authentication unavailable` |
 
 - `M` is the metadata URL below and `S` the required scopes, space-separated. Both are fixed at startup from the resource, never from `Host` or `X-Forwarded-*`. Every refusal carries `Cache-Control: no-store`; nothing from the token or an internal error is echoed.
-- Signing keys are refreshed 5 minutes after the last success, and at most once a minute whatever triggers it (an unknown `kid` included, which waits at most 2 s). A key the issuer stops publishing is refused from the next fetch on. Through an outage the last keys serve for 24 hours, then every request is answered 503.
+- Signing keys are refreshed 5 minutes after the last success, and at most once a minute whatever triggers it (an unknown `kid` included, which waits at most 2 s). A key the issuer stops publishing, or whose `kid` it reuses for other key material, is refused from the next fetch on, also for a request whose verification is under way: the key, the snapshot's age, the server's lifetime and the dates are checked again at one instant before admission. Through an outage the last keys serve for 24 hours, then every request is answered 503.
 
 ### Credential boundary
 

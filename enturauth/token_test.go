@@ -1,6 +1,7 @@
 package enturauth_test
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -94,6 +95,8 @@ func TestToken(t *testing.T) {
 			{"exp now-59", claim("iat", now-3600, "exp", now-59), ""},
 			{"lifetime 3600", claim("iat", now-1, "exp", now+3599), ""},
 			{"largest organisation", claim(org, json.Number("9223372036854775807")), ""},
+			{"same names in sibling objects", claim("extra", []any{map[string]any{"a": 1}, map[string]any{"a": 2}}), ""},
+			{"number beyond float64", claim("extra", json.Number("1e999")), ""},
 
 			{"alg none", header("alg", "none"), enturauth.RejectHeader},
 			{"alg HS256", header("alg", "HS256"), enturauth.RejectHeader},
@@ -187,13 +190,21 @@ func TestToken(t *testing.T) {
 			{"azp null", claim("azp", nil), enturauth.RejectClient},
 			{"machine client", claim("sub", "m2m@clients", "client_id", "m2m", "gty", "client-credentials"), enturauth.RejectClient},
 			{"scope missing", claim("scope", del{}), enturauth.RejectScope},
-			{"scope empty", claim("scope", ""), enturauth.RejectScope},
-			{"scope array", claim("scope", []any{"mcp:read"}), enturauth.RejectScope},
 			{"scope superstring", claim("scope", "mcp:readx"), enturauth.RejectScope},
 			{"scope case", claim("scope", "MCP:READ"), enturauth.RejectScope},
 			{"scope OIDC only", claim("scope", "openid profile email offline_access"), enturauth.RejectScope},
-			{"scope comma-separated", claim("scope", "openid,mcp:read"), enturauth.RejectScope},
-			{"scope tab-separated", claim("scope", "openid\tmcp:read"), enturauth.RejectScope},
+			{"scope comma-separated (one token)", claim("scope", "openid,mcp:read"), enturauth.RejectScope},
+			{"scope empty", claim("scope", ""), enturauth.RejectClaims},
+			{"scope null", claim("scope", nil), enturauth.RejectClaims},
+			{"scope array", claim("scope", []any{"mcp:read"}), enturauth.RejectClaims},
+			{"scope tab after required", claim("scope", "mcp:read \tother"), enturauth.RejectClaims},
+			{"scope tab-separated", claim("scope", "openid\tmcp:read"), enturauth.RejectClaims},
+			{"scope quote", claim("scope", `mcp:read "other`), enturauth.RejectClaims},
+			{"scope backslash", claim("scope", `mcp:read other\`), enturauth.RejectClaims},
+			{"scope non-ASCII", claim("scope", "mcp:read lås"), enturauth.RejectClaims},
+			{"scope double space", claim("scope", "openid  mcp:read"), enturauth.RejectClaims},
+			{"scope leading space", claim("scope", " mcp:read"), enturauth.RejectClaims},
+			{"scope trailing space", claim("scope", "mcp:read "), enturauth.RejectClaims},
 			{"organisation missing", claim(org, del{}), enturauth.RejectAdmission},
 			{"organisation null", claim(org, nil), enturauth.RejectAdmission},
 			{"organisation string", claim(org, "1"), enturauth.RejectAdmission},
@@ -229,6 +240,9 @@ func TestToken(t *testing.T) {
 		noSub := a0.Claims(cfg)
 		delete(noSub, "sub")
 		idClaims := map[string]any{"iss": dev, "aud": "client-a", "sub": "auth0|user", "nonce": "n", "iat": now, "exp": now + 3600}
+		var pretty bytes.Buffer
+		_ = json.Indent(&pretty, c, "", "  ")
+		nested := func(n int) []byte { return member(c, `"extra":`+strings.Repeat("[", n)+strings.Repeat("]", n)) }
 		tampered := a0.Claims(cfg)
 		tampered["sub"] = "auth0|admin"
 		resp, err := kittest.JWKSTransport(a0.Context(t.Context())).RoundTrip(httptest.NewRequest(http.MethodGet, dev+".well-known/jwks.json", nil))
@@ -247,6 +261,8 @@ func TestToken(t *testing.T) {
 			{"lowercase scheme", "", []string{"bearer " + valid}},
 			{"uppercase scheme", "", []string{"BEARER " + valid}},
 			{"at most 8 KiB", "", []string{"Bearer " + fits}},
+			{"claims with whitespace", "", []string{"Bearer " + a0.Sign(dev, h, pretty.Bytes())}},
+			{"32 levels of nesting", "", []string{"Bearer " + a0.Sign(dev, h, nested(31))}},
 			{"no credentials", enturauth.RejectNoToken, nil},
 			{"basic", enturauth.RejectNoToken, []string{"Basic eDp5"}},
 			{"two headers", enturauth.RejectRequest, []string{"Bearer " + valid, "Bearer " + valid}},
@@ -269,8 +285,16 @@ func TestToken(t *testing.T) {
 			{"duplicate iss", enturauth.RejectMalformed, []string{"Bearer " + a0.Sign(dev, h, member(c, `"iss":"https://evil.example/"`))}},
 			{"escaped duplicate iss", enturauth.RejectMalformed, []string{"Bearer " + a0.Sign(dev, h, member(c, `"iss":"`+dev+`"`))}},
 			{"duplicate sub", enturauth.RejectMalformed, []string{"Bearer " + a0.Sign(dev, h, member(c, `"sub":"auth0|admin"`))}},
+			{"nested duplicate", enturauth.RejectMalformed, []string{"Bearer " + a0.Sign(dev, h, member(c, `"extra":{"role":"read","role":"write"}`))}},
+			{"escaped nested duplicate", enturauth.RejectMalformed, []string{"Bearer " + a0.Sign(dev, h, member(c, `"extra":{"role":"read","\u0072ole":"write"}`))}},
+			{"duplicate in an array element", enturauth.RejectMalformed, []string{"Bearer " + a0.Sign(dev, h, member(c, `"extra":[1,{"a":1,"a":2}]`))}},
+			{"duplicate in a header member", enturauth.RejectMalformed, []string{"Bearer " + a0.Sign(dev, member(h, `"x":{"a":1,"a":2}`), c)}},
+			{"33 levels of nesting", enturauth.RejectMalformed, []string{"Bearer " + a0.Sign(dev, h, nested(32))}},
+			{"empty signature", enturauth.RejectMalformed, []string{"Bearer " + parts[0] + "." + parts[1] + "."}},
+			{"empty claims", enturauth.RejectMalformed, []string{"Bearer " + parts[0] + ".." + parts[2]}},
+			{"empty header", enturauth.RejectMalformed, []string{"Bearer ." + parts[1] + "." + parts[2]}},
 			{"sub not UTF-8", enturauth.RejectClaims, []string{"Bearer " + a0.Sign(dev, h, member(js(noSub), "\"sub\":\"auth0|\xff\""))}},
-			{"alg none, no signature", enturauth.RejectHeader, []string{"Bearer " + b64([]byte(`{"alg":"none","typ":"at+jwt","kid":"k1"}`)) + "." + parts[1] + "."}},
+			{"alg none, no signature", enturauth.RejectMalformed, []string{"Bearer " + b64([]byte(`{"alg":"none","typ":"at+jwt","kid":"k1"}`)) + "." + parts[1] + "."}},
 			{"HS256 keyed with the published JWKS", enturauth.RejectHeader, []string{"Bearer " + hs + "." + b64(mac.Sum(nil))}},
 			{"ID token", enturauth.RejectHeader, []string{"Bearer " + a0.Sign(dev, js(map[string]any{"alg": "RS256", "typ": "JWT", "kid": "k1"}), js(idClaims))}},
 			{"tampered claims", enturauth.RejectSignature, []string{"Bearer " + parts[0] + "." + b64(js(tampered)) + "." + parts[2]}},

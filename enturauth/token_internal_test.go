@@ -7,19 +7,23 @@ import (
 	"testing"
 )
 
-// FuzzParse checks that every token parse accepts is canonical strict
-// base64url and carries the header the contract requires.
+// FuzzParse checks that every token parse accepts has three non-empty,
+// canonical strict base64url segments, no duplicate member name at any depth
+// of its header and claims, and the header the contract requires.
 func FuzzParse(f *testing.F) {
 	enc := base64.RawURLEncoding.EncodeToString
 	h := enc([]byte(`{"alg":"RS256","typ":"at+jwt","kid":"k1"}`))
 	for _, s := range []string{
 		h + "." + enc([]byte(`{"iss":"https://partner.dev.entur.org/","exp":1}`)) + "." + enc([]byte("signature")),
 		h + ".e30.",
-		h + ".W10.",
-		h + ".e30=.",
-		h + ".e30.A",
-		enc([]byte(`{"alg":"RS256","alg":"none","typ":"at+jwt","kid":"k1"}`)) + ".e30.",
-		enc([]byte(`{"alg":"RS256","typ":"application/at+jwt","kid":"k1","crit":[]}`)) + ".e30.",
+		h + ".e30.AA",
+		h + ".W10.AA",
+		h + ".e30=.AA",
+		h + "." + enc([]byte(`{"x":{"a":1,"a":2}}`)) + ".AA",
+		h + "." + enc([]byte(`{"x":{"a":1,"a":2}}`)) + ".AA",
+		h + "." + enc([]byte(`{"x":[{"a":1,"a":2}],"y":"a:b"}`)) + ".AA",
+		enc([]byte(`{"alg":"RS256","alg":"none","typ":"at+jwt","kid":"k1"}`)) + ".e30.AA",
+		enc([]byte(`{"alg":"RS256","typ":"application/at+jwt","kid":"k1","crit":[]}`)) + ".e30.AA",
 		enc([]byte(`{"alg":"none"}`)) + ".e30.",
 		"..", "a.b.c", "",
 	} {
@@ -34,11 +38,15 @@ func FuzzParse(f *testing.F) {
 		var header map[string]any
 		for i, p := range parts {
 			b, err := base64.RawURLEncoding.DecodeString(p)
-			if err != nil || enc(b) != p {
-				t.Fatalf("accepted non-canonical segment %q", p)
+			if p == "" || err != nil || enc(b) != p {
+				t.Fatalf("accepted empty or non-canonical segment %q", p)
 			}
-			if i == 0 && json.Unmarshal(b, &header) != nil {
-				t.Fatalf("accepted header %q", b)
+			var v any
+			if i < 2 && (json.Unmarshal(b, &v) != nil || colons(b) != names(v)) {
+				t.Fatalf("accepted segment %q with a duplicate member", b)
+			}
+			if i == 0 {
+				header, _ = v.(map[string]any)
 			}
 		}
 		typ := header["typ"]
@@ -52,4 +60,40 @@ func FuzzParse(f *testing.F) {
 			}
 		}
 	})
+}
+
+// colons counts the name separators of a JSON text: one per member.
+func colons(b []byte) int {
+	n, in, esc := 0, false, false
+	for _, c := range b {
+		switch {
+		case esc:
+			esc = false
+		case in && c == '\\':
+			esc = true
+		case c == '"':
+			in = !in
+		case !in && c == ':':
+			n++
+		}
+	}
+	return n
+}
+
+// names counts the member names of every object in a decoded JSON value; a
+// duplicate collapses into one.
+func names(v any) int {
+	n := 0
+	switch v := v.(type) {
+	case map[string]any:
+		n = len(v)
+		for _, e := range v {
+			n += names(e)
+		}
+	case []any:
+		for _, e := range v {
+			n += names(e)
+		}
+	}
+	return n
 }
