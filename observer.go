@@ -9,8 +9,8 @@ import (
 // trusted application code and must not panic: they run synchronously on the
 // call's goroutine, and a panicking Started skips the call's Completed. They
 // cannot change a call's outcome and see sizes and status, never arguments or
-// results, except PackFailure.Err, which can quote a result's own encoding
-// error and is sensitive server-side data.
+// results, except PackFailure.Err and Recovery, which can quote a result's
+// own encoding error or a panic value and are sensitive server-side data.
 type Observer struct {
 	// Registered fires once per registration, on each endpoint a tool is
 	// registered on.
@@ -19,10 +19,13 @@ type Observer struct {
 	// is validated.
 	Started func(context.Context, Start)
 	// Completed fires exactly once per call that Started, after the final
-	// result is packed, or while a panic unwinds.
+	// result is packed, a recovered panic included.
 	Completed func(context.Context, Completion)
 	// PackFailed fires when a result could not be packed into the envelope.
 	PackFailed func(context.Context, PackFailure)
+	// Recovered fires when a handler or result packing panicked; the call
+	// then answers the tool's fallback failure text.
+	Recovered func(context.Context, Recovery)
 }
 
 // Start describes a call as it reaches the boundary.
@@ -39,8 +42,9 @@ type Completion struct {
 	Tool     string
 	Duration time.Duration
 	// OutputBytes is the length of the result's single text content: the
-	// envelope or the failure text. HasOutput is false when no result was
-	// produced (a panic); IsError then is false too.
+	// envelope or the failure text. HasOutput reports whether a result was
+	// produced; since panics are recovered it is false only when the handler's
+	// goroutine exited through runtime.Goexit.
 	OutputBytes int
 	HasOutput   bool
 	IsError     bool
@@ -53,4 +57,13 @@ type PackFailure struct {
 	Tool    string
 	Err     error
 	Marshal bool
+}
+
+// Recovery describes a panic recovered at the tool boundary. Value is what
+// was passed to panic and Stack the panicking goroutine's stack; both can
+// hold argument or result data, so keep them server-side.
+type Recovery struct {
+	Tool  string
+	Value any
+	Stack []byte
 }

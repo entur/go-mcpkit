@@ -337,10 +337,13 @@ func TestFailuresText(t *testing.T) {
 // completion, a pack failure only where packing failed, and never a value
 // from the arguments or result.
 func TestReadToolBoundary(t *testing.T) {
-	var started, completed, packed []string
+	var started, completed, packed, recovered []string
 	var last Completion
 	var calls int
 	obs := Observer{
+		Recovered: func(_ context.Context, r Recovery) {
+			recovered = append(recovered, fmt.Sprint(r.Tool, " ", r.Value, " ", strings.Contains(string(r.Stack), "panic")))
+		},
 		Started: func(_ context.Context, s Start) {
 			started = append(started, fmt.Sprint(s.InputBytes, s.HasInput))
 		},
@@ -381,9 +384,11 @@ func TestReadToolBoundary(t *testing.T) {
 		{"handler error", `{"text":"fail:keyed"}`, `gone a`, true, true, ""},
 		{"unclassified", `{"text":"fail:other"}`, `failed`, true, true, ""},
 		{"oversize", `{"text":"large"}`, `too large`, true, true, "true false"},
+		// Dispatched on the SDK's goroutine: unrecovered, this ends the process.
+		{"panic", `{"text":"panic"}`, `failed`, true, true, ""},
 	} {
 		for profile, s := range cs {
-			started, completed, packed, calls = nil, nil, nil, 0
+			started, completed, packed, recovered, calls = nil, nil, nil, nil, 0
 			var args any
 			if tc.args != "" {
 				args = json.RawMessage(tc.args)
@@ -404,24 +409,21 @@ func TestReadToolBoundary(t *testing.T) {
 			if tc.args != "" && started[0] != fmt.Sprint(len(tc.args), true) {
 				t.Errorf("%s/%d: start = %s", tc.name, profile, started[0])
 			}
+			if want := map[bool]string{true: "[echo handler panic true]", false: "[]"}[tc.name == "panic"]; fmt.Sprint(recovered) != want {
+				t.Errorf("%s/%d: recovered = %v, want %s", tc.name, profile, recovered, want)
+			}
 		}
 	}
 
-	// A panic still completes once, with no output, and keeps unwinding.
-	started, completed = nil, nil
+	// A panic while packing is recovered the same way: one completion with
+	// the fallback failure, one recovery, nothing escapes.
+	started, completed, recovered = nil, nil, nil
 	h := full.endpoints[0].handler("echo", mustResolve(t), policy, failures, func(context.Context, *mcp.CallToolRequest, json.RawMessage, any, error) (any, bool, error) {
-		panic("boom")
+		return panicMarshaler{}, false, nil
 	}, nil)
-	func() {
-		defer func() {
-			if recover() == nil {
-				t.Error("panic was swallowed")
-			}
-		}()
-		_, _ = h(context.Background(), &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Arguments: json.RawMessage(`{}`)}})
-	}()
-	if fmt.Sprint(started, completed) != "[2 true] [false false]" {
-		t.Errorf("panic: started=%v completed=%v", started, completed)
+	res, err := h(context.Background(), &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Arguments: json.RawMessage(`{}`)}})
+	if err != nil || !res.IsError || text(res) != failures.Fallback || fmt.Sprint(started, completed, recovered) != "[2 true] [true true] [echo marshal panic true]" {
+		t.Errorf("packing panic: err=%v res=%v started=%v completed=%v recovered=%v", err, res, started, completed, recovered)
 	}
 
 	// The M365 profile changes descriptors only.
@@ -948,3 +950,8 @@ func TestUntrustedDataRule(t *testing.T) {
 		}
 	}
 }
+
+// panicMarshaler panics when the envelope is encoded.
+type panicMarshaler struct{}
+
+func (panicMarshaler) MarshalJSON() ([]byte, error) { panic("marshal panic") }

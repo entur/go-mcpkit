@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -191,6 +192,18 @@ func (ep *Endpoint) handler(name string, schema *jsonschema.Resolved, policy out
 				obs.Completed(ctx, done)
 			}()
 		}
+		// A panic in the handler or while packing becomes the tool's fixed
+		// fallback failure. The SDK runs this on its own goroutine, where no
+		// HTTP recovery reaches, so an unrecovered panic would end the process.
+		// Registered after the Completed defer, so that one sees the result.
+		defer func() {
+			if v := recover(); v != nil {
+				result = failure(f.Fallback)
+				if obs.Recovered != nil {
+					obs.Recovered(ctx, Recovery{Tool: name, Value: v, Stack: debug.Stack()})
+				}
+			}
+		}()
 		packFailed := func(pf PackFailure) {
 			if obs.PackFailed != nil {
 				obs.PackFailed(ctx, pf)
