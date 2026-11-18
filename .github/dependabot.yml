@@ -1,0 +1,47 @@
+# Monthly, with a 7-day cooldown for version updates (security updates are
+# not delayed). Minor and patch updates are grouped; major updates arrive as
+# individual PRs, except the MCP Go SDK, which always has its own group.
+# The commit prefixes never trigger a release.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directories: ["/", "/tools"] # "/" is the library module; "/tools" holds dev tools only
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # SDK behaviour changes must arrive as their own pull request, never
+      # mixed with other updates: the SDK has its own group (any update type)
+      # and is excluded from the general groups below.
+      mcp-go-sdk:
+        applies-to: version-updates
+        patterns: ["github.com/modelcontextprotocol/go-sdk"]
+      go-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        exclude-patterns: ["github.com/modelcontextprotocol/go-sdk"]
+        update-types: [minor, patch]
+      go-security:
+        applies-to: security-updates
+        patterns: ["*"]
+        exclude-patterns: ["github.com/modelcontextprotocol/go-sdk"]
