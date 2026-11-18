@@ -18,6 +18,7 @@ Every server built with the kit behaves the same on the wire. The normative desc
 - Tools are read-only, and their descriptors and schemas are frozen at registration.
 - Each endpoint states an access posture and a reason: `Protected` (HTTP behind the application's authentication), `PublicReadOnly`, or `LocalProcess` (stdio only). The zero value is refused.
 - HTTP guards run in a fixed order: panic recovery, security headers, write deadline, body cap, authentication, subject rate limit, transport.
+- `enturauth` makes a `Protected` endpoint an OAuth resource server for one Entur Auth0 issuer; the bearer never reaches a tool handler.
 
 ## Quick start
 
@@ -71,7 +72,7 @@ func main() {
 }
 ```
 
-[example_test.go](example_test.go) has runnable examples of a protected HTTP endpoint with its own access policy and of several endpoints, one with the Microsoft 365 descriptor profile.
+[example_test.go](example_test.go) has runnable examples of a protected HTTP endpoint with its own toy authentication and of several endpoints, one with the Microsoft 365 descriptor profile.
 
 ## Packages
 
@@ -82,11 +83,49 @@ func main() {
 | `retrieved` | Normalises and bounds externally authored text before it enters a result |
 | `pagepack` | Packs ordered records into size-bounded pages |
 | `httpguard` | The HTTP guards `Handler` composes, for use on their own |
+| `enturauth` | OAuth resource server for Entur's Auth0 tenants: RFC 9068 token validation for a `Protected` endpoint, RFC 9728 metadata |
 | `mcpkittest` | Test helpers; import only from `_test.go` files |
+| `mcpkittest/enturauthtest` | An in-memory Auth0 stand-in that mints test tokens; import only from `_test.go` files |
 
-## Not in v0.1.0
+## Protected HTTP with Auth0
 
-Auth0 resource-server validation (token verification and the `Protected` policy built on it) arrives in v0.2.0. Until then a `Protected` endpoint takes the application's own authentication wrapper.
+An MCP host logs the user in at Auth0 and sends the access token as a bearer; `enturauth` validates it on every request and publishes the protected-resource metadata. Login, consent and token issuance stay at Auth0. The behaviour is in [doc/contract.md](doc/contract.md#auth0-resource-server), the decision in [ADR 0001](doc/adr/0001-enturauth.adoc).
+
+```go
+// ctx is the server's lifetime: the signing keys stay fresh until it ends.
+auth, err := enturauth.New(ctx, enturauth.Config{
+	Tenant:         enturauth.Partner,
+	Env:            enturauth.Prd,
+	Resource:       "https://mcp.example.com/partner", // the Auth0 API identifier
+	ClientIDs:      []string{"pre-registered-public-client"},
+	RequiredScopes: []string{"mcp:read"},
+	Admission:      enturauth.AllowAnyOrganisation("data every partner organisation may read"),
+})
+if err != nil {
+	log.Fatal(err)
+}
+b := mcpkit.New(mcpkit.Options{})
+ep, err := b.Endpoint("partner", mcpkit.EndpointOptions{
+	Implementation: mcp.Implementation{Name: "partner", Version: "1.0.0"},
+	Access:         auth.Access(),
+	Instructions:   rule,
+})
+// ... add tools; a handler reads the caller with enturauth.FromContext(ctx).
+mux := http.NewServeMux()
+if err := auth.MountMetadata(mux); err != nil {
+	log.Fatal(err)
+}
+h, err := b.Handler(mcpkit.HTTPOptions{
+	Mux:           mux,
+	Routes:        []mcpkit.Route{{Path: "/partner", Endpoint: ep}},
+	Limiter:       httpguard.NewSubjectLimiter(rate.Every(time.Second), 10, time.Minute),
+	Subject:       enturauth.SubjectKey,
+	BodyBytes:     64 * output.KiB,
+	WriteDeadline: time.Minute,
+})
+```
+
+`auth.Ready()` serves a startup probe. Tests build the authenticator from `enturauthtest.New(t).Context(ctx)` and mint tokens with its `Token` and `Claims`.
 
 Security reports: [SECURITY.md](SECURITY.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 

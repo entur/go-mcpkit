@@ -6,13 +6,13 @@ Operations, CI and release material for the people who run this repository. User
 
 | Workflow | Jobs | When |
 |---|---|---|
-| `ci.yml` | `test (floor)`, `test (stable)`, `test-386`, `lint`, `vuln`, `scripts`, `zizmor` | pull requests, pushes to `main`, weekly |
+| `ci.yml` | `test (floor)`, `test (stable)`, `test-386`, `lint`, `vuln`, `fuzz`, `scripts`, `zizmor` | pull requests, pushes to `main`, weekly |
 | `codeql.yml` | `CodeQL (go)`, `CodeQL (actions)` on pull requests; the shared code-scan workflow on `main` and weekly | as stated |
 | `scorecard.yml` | OpenSSF Scorecard | pushes to `main`, weekly |
 | `release.yml` | release-please, `verify-module`, tag audit | pushes to `main` |
 | `tag-guard.yml` | tag audit and issue on failure | `v*` tag push, daily, on demand from `main`, from `release.yml` |
 
-`test (floor)` runs the exact Go version in `go.mod`'s `go` directive, and `test (stable)` the latest Go release. The weekly run refreshes the vulnerability data. 
+`test (floor)` runs the exact Go version in `go.mod`'s `go` directive, and `test (stable)` the latest Go release. The weekly run refreshes the vulnerability data. `fuzz` runs the `enturauth` token parser's fuzz target for 20 s.
 
 ## Supply-chain policy
 
