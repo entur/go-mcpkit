@@ -18,9 +18,36 @@ linters:
   exclusions:
     presets:
       - comments
+    rules:
+      # Tests keep tables, sentinels and helper style of their own; vet, the
+      # race detector and review cover them.
+      - path: _test\.go
+        linters: [errcheck, errorlint, gochecknoglobals, gosec, mnd, revive]
+      - path: _test\.go
+        text: SA1019|SA1029|ST1012|ST1018
+        linters: [staticcheck]
+      # The package state AGENTS.md permits: the kittest hook, httpguard's
+      # sync.Once, and the read-only keyword tables of the schema widener.
+      - path: ^(httpguard/httpguard|internal/kittest/kittest|output/openschema)\.go$
+        linters: [gochecknoglobals]
+      # JSON string-escape widths and a 128-byte token bound, named by their
+      # one use.
+      - path: ^(output/output|retrieved/retrieved)\.go$
+        linters: [mnd]
+      # The class is shown in a configuration error, not wrapped.
+      - path: ^failures\.go$
+        text: non-wrapping format verb
+        linters: [errorlint]
+      # The copy of a T is a T.
+      - path: ^snapshot\.go$
+        text: unchecked-type-assertion
+        linters: [revive]
+      - text: QF1001 # the flagged condition is clearer undistributed
+        linters: [staticcheck]
   settings:
     exhaustive:
       default-signifies-exhaustive: true
+      explicit-exhaustive: true # check only switches marked //exhaustive:enforce
     mnd:
       ignored-files:
         - ".*_test.go" # don't include magic numbers tests in test files
@@ -54,6 +81,17 @@ linters:
           disabled: true
         - name: function-length
           disabled: true
+        - name: redefines-builtin-id # max is a local name for a byte limit; the built-in is not used there
+          disabled: true
+        - name: enforce-switch-style # A default clause adds an unreachable branch to the partial switches
+          disabled: true
+        - name: flag-parameter # The flagged booleans select a mode of one shared walk
+          disabled: true
+        - name: bool-literal-in-expr # The flagged `!= true` compares a decoded JSON value with the boolean schema true, not a bool expression
+          disabled: true
+        - name: unchecked-type-assertion
+          arguments:
+            - acceptIgnoredAssertionResult: true
         - name: unhandled-error # These never return a non-nil error (documented); examples print to stdout
           arguments:
             - "fmt.Print"
@@ -61,6 +99,7 @@ linters:
             - "fmt.Println"
             - "strings.Builder.WriteByte"
             - "strings.Builder.WriteString"
+            - "strings.Builder.WriteRune"
             - "bytes.Buffer.WriteByte"
             - "bytes.Buffer.WriteString"
 formatters:

@@ -5,6 +5,10 @@
 # a code owner's review. Narrow these to a maintainers team when one exists.
 /output/ @entur/team-ki-effekt
 /httpguard/ @entur/team-ki-effekt
+/retrieved/ @entur/team-ki-effekt
+/mcpkittest/ @entur/team-ki-effekt
+/internal/ @entur/team-ki-effekt
+/doc/contract.md @entur/team-ki-effekt
 /enturauth/ @entur/team-ki-effekt
 /*.go @entur/team-ki-effekt
 /.github/ @entur/team-ki-effekt
