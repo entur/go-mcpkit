@@ -1,6 +1,7 @@
 package enturauth
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
@@ -22,6 +23,8 @@ func FuzzParse(f *testing.F) {
 		h + "." + enc([]byte(`{"x":{"a":1,"a":2}}`)) + ".AA",
 		h + "." + enc([]byte(`{"x":{"a":1,"a":2}}`)) + ".AA",
 		h + "." + enc([]byte(`{"x":[{"a":1,"a":2}],"y":"a:b"}`)) + ".AA",
+		h + "." + enc([]byte(`{"extra":1e9999}`)) + ".AA",
+		enc([]byte(`{"alg":"RS256","typ":"at+jwt","kid":"k1","extra":1e9999}`)) + ".e30.AA",
 		enc([]byte(`{"alg":"RS256","alg":"none","typ":"at+jwt","kid":"k1"}`)) + ".e30.AA",
 		enc([]byte(`{"alg":"RS256","typ":"application/at+jwt","kid":"k1","crit":[]}`)) + ".e30.AA",
 		enc([]byte(`{"alg":"none"}`)) + ".e30.",
@@ -42,7 +45,9 @@ func FuzzParse(f *testing.F) {
 				t.Fatalf("accepted empty or non-canonical segment %q", p)
 			}
 			var v any
-			if i < 2 && (json.Unmarshal(b, &v) != nil || colons(b) != names(v)) {
+			d := json.NewDecoder(bytes.NewReader(b))
+			d.UseNumber() // as parse does: a number beyond float64 is valid JSON
+			if i < 2 && (d.Decode(&v) != nil || colons(b) != names(v)) {
 				t.Fatalf("accepted segment %q with a duplicate member", b)
 			}
 			if i == 0 {

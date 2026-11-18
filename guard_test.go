@@ -7,10 +7,10 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 const module = "github.com/entur/go-mcpkit"
@@ -42,30 +42,47 @@ func TestTestSupportStaysOutOfProduction(t *testing.T) {
 		}
 	}
 
+	violations, err := setterViolations(os.DirFS("."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range violations {
+		t.Error(v)
+	}
+}
+
+// setterViolations names every non-test Go file in fsys that refers to a
+// kittest setter outside its approved directory. It skips only .git and
+// testdata: a package under any other directory, a hidden one included, can
+// be imported by path.
+func setterViolations(fsys fs.FS) ([]string, error) {
+	var found []string
 	fset := token.NewFileSet()
-	err = filepath.WalkDir(".", func(p string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
 		switch {
 		case err != nil:
 			return err
-		case d.IsDir() && p != "." && strings.HasPrefix(d.Name(), "."):
+		case d.IsDir() && (d.Name() == ".git" || d.Name() == "testdata"):
 			return fs.SkipDir
 		case d.IsDir() || !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go"):
 			return nil
 		}
-		f, err := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
+		src, err := fs.ReadFile(fsys, p)
+		if err != nil {
+			return err
+		}
+		f, err := parser.ParseFile(fset, p, src, parser.SkipObjectResolution)
 		if err != nil {
 			return err
 		}
 		for _, s := range setterRefs(f) {
-			if !strings.HasPrefix(filepath.ToSlash(p), setters[s]) {
-				t.Errorf("%s refers to kittest.%s outside %s", p, s, setters[s])
+			if !strings.HasPrefix(p, setters[s]) {
+				found = append(found, p+" refers to kittest."+s+" outside "+setters[s])
 			}
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	return found, err
 }
 
 // setterRefs returns the kittest setters f refers to under whatever name it
@@ -114,5 +131,18 @@ func TestSetterRefs(t *testing.T) {
 		if got := strings.Join(setterRefs(f), " "); got != tc.want {
 			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
 		}
+	}
+
+	install := []byte(`package x; import ("context"; "github.com/entur/go-mcpkit/internal/kittest")
+func Install(ctx context.Context) context.Context { return kittest.WithJWKSTransport(ctx, nil) }`)
+	got, err := setterViolations(fstest.MapFS{
+		".hidden/x/install.go":                {Data: install}, // importable by path, though ./... skips it
+		"mcpkittest/enturauthtest/install.go": {Data: install}, // approved
+		"x/install_test.go":                   {Data: install}, // a test
+		"testdata/x/install.go":               {Data: install}, // never built
+		".git/x/install.go":                   {Data: install}, // repository metadata
+	})
+	if want := ".hidden/x/install.go refers to kittest.WithJWKSTransport outside mcpkittest/enturauthtest/"; err != nil || strings.Join(got, "; ") != want {
+		t.Errorf("setterViolations: %q, %v; want %q", got, err, want)
 	}
 }
