@@ -21,7 +21,7 @@ A successful `tools/call` returns one text content item and the same value as `s
 A call that fails inside a registered tool (input validation, the handler, packing) returns `isError: true` and one text content item, with no `structuredContent`. The text is a literal chosen at registration from the tool's failure catalog, by failure class and optionally by a key. It never contains an error message, argument, upstream response or credential. Failure texts are therefore fixed server strings; clients must not parse them. Protocol and lookup errors the MCP SDK raises before the tool boundary, such as an unknown tool name (`-32602`, a message that echoes the requested name), are JSON-RPC errors, not tool results, and carry the SDK's text.
 
 - Input that does not validate against the tool's input schema yields the catalog's "invalid argument" text, before a typed tool's handler runs. A projected tool's application instead receives the validation verdict first, and the failure it selects may be another registered literal (an admission refusal, say).
-- An error without a matching entry, and a result that cannot be encoded, yield the catalog's fallback text.
+- An error without a matching entry, a result that cannot be encoded, and a panic in the handler or while packing yield the catalog's fallback text.
 - A payload that itself reports a tool error keeps its envelope and sets `isError: true`.
 
 ## Transport
@@ -49,7 +49,7 @@ Every endpoint declares one posture and a non-blank reason: `protected` (HTTP, b
 
 Order of execution for one request; an earlier guard that rejects ends the request:
 
-1. Panic recovery: a panic that unwinds through the HTTP handler before anything was written answers a fixed 500; after the response started, its status stays. The application is told only through its optional callback. Request-time callbacks (tool handlers, the per-call observers `started`, `completed` and `pack failed`, and content request handlers and middleware) run on the SDK's own goroutines, outside this recovery: a panic there terminates the process, so they must not panic (or must recover themselves). Registration-time callbacks (`registered`, content setup) run synchronously in the caller.
+1. Panic recovery: a panic that unwinds through the HTTP handler before anything was written answers a fixed 500; after the response started, its status stays. The application is told only through its optional callback. Request-time callbacks run on the SDK's own goroutines, outside this recovery. A panic in a tool handler or while packing its result is recovered at the tool boundary: the call answers the tool's fallback failure text and the application is told through the `recovered` observer. The per-call observers (`started`, `completed`, `pack failed`, `recovered`) and content request handlers and middleware are not recovered: a panic there terminates the process, so they must not panic (or must recover themselves). Registration-time callbacks (`registered`, content setup) run synchronously in the caller.
 2. Security headers on every response: HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, a `default-src 'none'; frame-ancestors 'none'` CSP.
 3. Application middleware for the whole mux, then routing.
 4. On an MCP route: application pre-guard hook, write deadline, request body cap (enforced when the body is read: a guard that runs earlier, authentication for one, may answer first, the SDK transport answers 413 when it reads past the cap, while application middleware that reads the body, such as a `Protected` wrapper, sees `*http.MaxBytesError` and chooses its own status), the endpoint's authentication, the per-subject rate limit (shared across `protected` routes; over the limit answers 429 with `Retry-After`), application post-limit hook, the transport.
@@ -57,9 +57,10 @@ Order of execution for one request; an earlier guard that rejects ends the reque
 
 ## Observer
 
-An observer is trusted application code and must not panic. It runs synchronously on the call's goroutine and cannot change a call's outcome. It sees names, sizes, durations and status, never arguments or results, with one exception: a pack failure's cause can quote a result's own encoding error, so treat it as sensitive server-side data (log with care, never return it to a caller).
+An observer is trusted application code and must not panic. It runs synchronously on the call's goroutine and cannot change a call's outcome. It sees names, sizes, durations and status, never arguments or results, with two exceptions: a pack failure's cause can quote a result's own encoding error, and a recovered panic's value and stack can hold argument or result data, so treat both as sensitive server-side data (log with care, never return them to a caller).
 
 - `registered`: once per tool registration on each endpoint.
 - `started`: when a call reaches the tool boundary, before input validation; carries the raw argument size.
-- `completed`: exactly once for every started call whose `started` observer returned, after the final result is packed or while a panic unwinds; carries duration, output size, whether a result exists and whether it is an error.
+- `completed`: exactly once for every started call whose `started` observer returned, after the final result is packed (a recovered panic included); carries duration, output size, whether a result exists and whether it is an error.
 - `pack failed`: when a result could not be packed into the envelope, with the cause and whether encoding itself failed.
+- `recovered`: when a tool handler or result packing panicked, with the panic value and stack; the call answers the fallback failure.
