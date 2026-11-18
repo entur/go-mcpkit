@@ -62,7 +62,7 @@ func setterViolations(fsys fs.FS) ([]string, error) {
 		switch {
 		case err != nil:
 			return err
-		case d.IsDir() && (d.Name() == ".git" || d.Name() == "testdata"):
+		case d.IsDir() && d.Name() == ".git":
 			return fs.SkipDir
 		case d.IsDir() || !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go"):
 			return nil
@@ -139,10 +139,10 @@ func Install(ctx context.Context) context.Context { return kittest.WithJWKSTrans
 		".hidden/x/install.go":                {Data: install}, // importable by path, though ./... skips it
 		"mcpkittest/enturauthtest/install.go": {Data: install}, // approved
 		"x/install_test.go":                   {Data: install}, // a test
-		"testdata/x/install.go":               {Data: install}, // never built
+		"testdata/x/install.go":               {Data: install}, // importable by path, though ./... skips it
 		".git/x/install.go":                   {Data: install}, // repository metadata
 	})
-	if want := ".hidden/x/install.go refers to kittest.WithJWKSTransport outside mcpkittest/enturauthtest/"; err != nil || strings.Join(got, "; ") != want {
+	if want := ".hidden/x/install.go refers to kittest.WithJWKSTransport outside mcpkittest/enturauthtest/; testdata/x/install.go refers to kittest.WithJWKSTransport outside mcpkittest/enturauthtest/"; err != nil || strings.Join(got, "; ") != want {
 		t.Errorf("setterViolations: %q, %v; want %q", got, err, want)
 	}
 }
