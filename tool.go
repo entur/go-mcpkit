@@ -192,56 +192,57 @@ func (ep *Endpoint) handler(name string, schema *jsonschema.Resolved, policy out
 				obs.Completed(ctx, done)
 			}()
 		}
-		// A panic in the handler or while packing becomes the tool's fixed
-		// fallback failure. The SDK runs this on its own goroutine, where no
-		// HTTP recovery reaches, so an unrecovered panic would end the process.
-		// Registered after the Completed defer, so that one sees the result.
-		defer func() {
-			if v := recover(); v != nil {
-				result = failure(f.Fallback)
-				if obs.Recovered != nil {
-					obs.Recovered(ctx, Recovery{Tool: name, Value: v, Stack: debug.Stack()})
-				}
-			}
-		}()
-		packFailed := func(pf PackFailure) {
-			if obs.PackFailed != nil {
-				obs.PackFailed(ctx, pf)
-			}
+		result, pack, rec := respond(ctx, req, raw, name, schema, policy, f, invoke)
+		if pack != nil && obs.PackFailed != nil {
+			obs.PackFailed(ctx, *pack)
 		}
-
-		var args any
-		var invalid error
-		if json.Unmarshal(raw, &args) != nil || schema.Validate(args) != nil {
-			args, invalid = nil, output.ErrInvalidArgument
+		if rec != nil && obs.Recovered != nil {
+			obs.Recovered(ctx, *rec)
 		}
-		data, isError, err := invoke(ctx, req, raw, args, invalid)
-		if err != nil {
-			return failure(f.Text(err)), nil
-		}
-		envelope, err := output.Wrap(data, policy)
-		if err != nil {
-			packFailed(PackFailure{Tool: name, Err: err})
-			if errors.Is(err, output.ErrResultTooLarge) {
-				return failure(f.Text(err)), nil
-			}
-			return failure(f.Fallback), nil
-		}
-		wire, err := json.Marshal(envelope)
-		if err != nil {
-			packFailed(PackFailure{Tool: name, Err: err, Marshal: true})
-			return failure(f.Fallback), nil
-		}
-		result = &mcp.CallToolResult{
-			Content:           []mcp.Content{&mcp.TextContent{Text: string(wire)}},
-			StructuredContent: json.RawMessage(wire),
-			IsError:           isError,
-		}
-		if check != nil {
-			check(wire)
+		if check != nil && result.StructuredContent != nil {
+			check(result.StructuredContent.(json.RawMessage))
 		}
 		return result, nil
 	}
+}
+
+// respond validates, invokes and packs one call. A panic in any of those
+// becomes the tool's fixed fallback failure: the SDK runs tool handlers on
+// its own goroutine, where no HTTP recovery reaches, so an unrecovered panic
+// would end the process. Observers and the test hook run outside, in the
+// handler, so their panics are not recovered.
+func respond(ctx context.Context, req *mcp.CallToolRequest, raw json.RawMessage, name string, schema *jsonschema.Resolved, policy output.Policy, f Failures, invoke invoker) (res *mcp.CallToolResult, pack *PackFailure, rec *Recovery) {
+	defer func() {
+		if v := recover(); v != nil {
+			res, pack, rec = failure(f.Fallback), nil, &Recovery{Tool: name, Value: v, Stack: debug.Stack()}
+		}
+	}()
+	var args any
+	var invalid error
+	if json.Unmarshal(raw, &args) != nil || schema.Validate(args) != nil {
+		args, invalid = nil, output.ErrInvalidArgument
+	}
+	data, isError, err := invoke(ctx, req, raw, args, invalid)
+	if err != nil {
+		return failure(f.Text(err)), nil, nil
+	}
+	envelope, err := output.Wrap(data, policy)
+	if err != nil {
+		text := f.Fallback
+		if errors.Is(err, output.ErrResultTooLarge) {
+			text = f.Text(err)
+		}
+		return failure(text), &PackFailure{Tool: name, Err: err}, nil
+	}
+	wire, err := json.Marshal(envelope)
+	if err != nil {
+		return failure(f.Fallback), &PackFailure{Tool: name, Err: err, Marshal: true}, nil
+	}
+	return &mcp.CallToolResult{
+		Content:           []mcp.Content{&mcp.TextContent{Text: string(wire)}},
+		StructuredContent: json.RawMessage(wire),
+		IsError:           isError,
+	}, nil, nil
 }
 
 func failure(text string) *mcp.CallToolResult {

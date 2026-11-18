@@ -438,6 +438,45 @@ func TestReadToolBoundary(t *testing.T) {
 	}
 }
 
+// TestCallbacksOutsideRecovery: only validation, the handler and packing are
+// recovered. A panicking observer or result-validation hook still escapes,
+// after the call's one completion, so a test assertion cannot be swallowed.
+func TestCallbacksOutsideRecovery(t *testing.T) {
+	big := func(context.Context, *mcp.CallToolRequest, json.RawMessage, any, error) (any, bool, error) {
+		return slices.Repeat([]string{strings.Repeat("x", 60)}, 20), false, nil
+	}
+	ok := func(context.Context, *mcp.CallToolRequest, json.RawMessage, any, error) (any, bool, error) {
+		return map[string]string{"a": "b"}, false, nil
+	}
+	for _, tc := range []struct {
+		name   string
+		obs    Observer
+		invoke invoker
+		check  func([]byte)
+	}{
+		{"pack failed observer", Observer{PackFailed: func(context.Context, PackFailure) { panic("observer") }}, big, nil},
+		{"validation hook", Observer{}, ok, func([]byte) { panic("assertion") }},
+	} {
+		var completed int
+		var recovered bool
+		tc.obs.Completed = func(context.Context, Completion) { completed++ }
+		tc.obs.Recovered = func(context.Context, Recovery) { recovered = true }
+		ep := endpoint(t, New(Options{Observer: tc.obs}), ProfileDefault, nil)
+		h := ep.handler("t", mustResolve(t), policy, failures, tc.invoke, tc.check)
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s: panic was recovered", tc.name)
+				}
+			}()
+			_, _ = h(context.Background(), &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Arguments: json.RawMessage(`{}`)}})
+		}()
+		if completed != 1 || recovered {
+			t.Errorf("%s: completed=%d recovered=%v", tc.name, completed, recovered)
+		}
+	}
+}
+
 func mustResolve(t *testing.T) *jsonschema.Resolved {
 	r, err := (&jsonschema.Schema{Type: "object"}).Resolve(nil)
 	if err != nil {
